@@ -4,13 +4,23 @@ A Spotify-style floating miniplayer for YouTube Music, displayed on the Windows 
 
 ## Features
 
-- **Album art** with rounded corners
+- **Album art** with rounded corners and smooth crossfade transitions
 - **Title & artist** display with auto-scrolling for long titles
 - **Transport controls**: Previous / Play-Pause / Next
-- **Real-time progress bar** with smooth interpolation
+- **Real-time progress bar** with high-resolution interpolation
 - **Click-to-seek** on the progress bar
 - **Auto light/dark theme** based on Windows settings
 - **Smart hiding** when YouTube Music stops or goes fullscreen
+- **Adaptive polling** for optimized CPU usage
+- **Dirty rectangle rendering** for efficient redraws
+
+## Performance Optimizations
+
+- **Adaptive polling**: 250ms when playing, 1000ms when paused
+- **High-resolution interpolation**: Uses `std::chrono::steady_clock` for smooth progress
+- **Resource caching**: Fonts and brushes cached to reduce GDI+ allocations
+- **Dirty rectangles**: Only redraws changed regions
+- **Skip hidden redraws**: No rendering when window is hidden
 
 ## Requirements
 

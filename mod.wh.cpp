@@ -2,7 +2,7 @@
 // @id              taskbar-music-lounge-ytm
 // @name            Taskbar Music Lounge - YouTube Music
 // @description     Spotify-style miniplayer for YouTube Music with album art, controls, progress bar and crossfade transitions.
-// @version         1.4.1
+// @version         1.5.0
 // @author          Hashah2311 / fork
 // @include         explorer.exe
 // @compilerOptions -lole32 -ldwmapi -lgdi32 -luser32 -lwindowsapp -lshcore -lgdiplus -lshell32
@@ -72,6 +72,7 @@ A Spotify-style floating miniplayer that activates **only** when YouTube Music i
 #include <cstdio>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -158,6 +159,35 @@ ULONGLONG g_LastPosTick   = 0;
 double    g_LocalPos      = 0.0;
 ULONGLONG g_SeekLockUntil = 0;
 
+// High-resolution interpolation anchor
+std::chrono::steady_clock::time_point g_InterpolationAnchor;
+
+// Adaptive polling
+int  g_CurrentPollInterval = 500;
+bool g_IsPlaying           = false;
+
+// Dirty rectangles for efficient redraws
+bool g_NeedsProgressRedraw = false;
+bool g_NeedsArtRedraw      = false;
+RECT g_ArtRect             = {0, 0, 0, 0};
+RECT g_TitleRect           = {0, 0, 0, 0};
+RECT g_ArtistRect          = {0, 0, 0, 0};
+
+// Cached GDI+ resources
+SolidBrush* g_CachedTrackBrush  = nullptr;
+SolidBrush* g_CachedFillBrush   = nullptr;
+SolidBrush* g_CachedTimeBrush   = nullptr;
+Font*       g_CachedTitleFont   = nullptr;
+Font*       g_CachedArtistFont  = nullptr;
+Font*       g_CachedTimeFont    = nullptr;
+FontFamily* g_CachedFontFamily  = nullptr;
+Color       g_CachedTextColor;
+bool        g_CacheValid        = false;
+
+// Async art loading
+bool  g_ArtLoadPending  = false;
+HANDLE g_ArtLoadThread   = nullptr;
+
 // ─── Crossfade State ─────────────────────────────────────────────────────────
 Bitmap* g_PrevArt    = nullptr;
 int     g_FadeAlpha  = 255;
@@ -218,6 +248,42 @@ wstring FormatTime(double sec) {
     int s = (int)sec, m = s/60; s %= 60;
     WCHAR buf[16]; swprintf_s(buf, L"%d:%02d", m, s);
     return buf;
+}
+
+double GetHighResTime() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+
+// ─── Resource Cache ──────────────────────────────────────────────────────────
+void InvalidateCache() {
+    g_CacheValid = false;
+}
+
+void UpdateResourceCache(Graphics& gfx, int titleFontSize, int artistFontSize, int timeFont, Color textCol, Color subCol) {
+    if (g_CacheValid && 
+        g_CachedTextColor.GetValue() == textCol.GetValue()) return;
+    
+    if (g_CachedTrackBrush) { delete g_CachedTrackBrush; g_CachedTrackBrush = nullptr; }
+    if (g_CachedFillBrush) { delete g_CachedFillBrush; g_CachedFillBrush = nullptr; }
+    if (g_CachedTimeBrush) { delete g_CachedTimeBrush; g_CachedTimeBrush = nullptr; }
+    
+    g_CachedTrackBrush = new SolidBrush(Color(70, textCol.GetRed(), textCol.GetGreen(), textCol.GetBlue()));
+    g_CachedFillBrush = new SolidBrush(textCol);
+    g_CachedTimeBrush = new SolidBrush(subCol);
+    
+    if (g_CachedTitleFont) { delete g_CachedTitleFont; g_CachedTitleFont = nullptr; }
+    if (g_CachedArtistFont) { delete g_CachedArtistFont; g_CachedArtistFont = nullptr; }
+    if (g_CachedTimeFont) { delete g_CachedTimeFont; g_CachedTimeFont = nullptr; }
+    if (g_CachedFontFamily) { delete g_CachedFontFamily; g_CachedFontFamily = nullptr; }
+    
+    g_CachedFontFamily = new FontFamily(FONT_TITLE);
+    g_CachedTitleFont = new Font(g_CachedFontFamily, (REAL)titleFontSize, FontStyleBold, UnitPixel);
+    g_CachedArtistFont = new Font(g_CachedFontFamily, (REAL)artistFontSize, FontStyleRegular, UnitPixel);
+    g_CachedTimeFont = new Font(g_CachedFontFamily, (REAL)timeFont, FontStyleBold, UnitPixel);
+    
+    g_CachedTextColor = textCol;
+    g_CacheValid = true;
 }
 
 void AddRoundedRect(GraphicsPath& path, int x, int y, int w, int h, int r) {
@@ -368,10 +434,8 @@ void UpdateMediaInfo() {
                 auto end = tline.EndTime();
                 g_Media.duration = chrono::duration<double>(end).count();
 
-                // ── Position sync (1.2.0-style raw drift check) ───────────────
+                // ── High-resolution position sync ───────────────────────────────
                 // Only update when not scrubbing and seek-lock has expired.
-                // Compare GSMTC position directly against g_LocalPos (not an
-                // interpolated value) so a recent seek never triggers a false snap.
                 if (!g_Scrubbing && now >= g_SeekLockUntil) {
                     auto pos      = tline.Position();
                     double newPos = chrono::duration<double>(pos).count();
@@ -380,6 +444,7 @@ void UpdateMediaInfo() {
                         g_Media.position = newPos;
                         g_LocalPos       = newPos;
                         g_LastPosTick    = now;
+                        g_InterpolationAnchor = std::chrono::steady_clock::now();
                     }
                 }
             }
@@ -444,12 +509,12 @@ void SeekTo(double seconds) {
                     chrono::duration<double>(seconds)).count();
                 s.TryChangePlaybackPositionAsync(ticks);
 
-                // Anchor interpolator at the seek target and lock GSMTC writes
-                // for 1 s so the bar does not snap back while YTM processes the seek.
+                // Anchor interpolator at the seek target
                 ULONGLONG now   = GetTickCount64();
                 g_LocalPos      = seconds;
                 g_LastPosTick   = now;
                 g_SeekLockUntil = now + 1000;
+                g_InterpolationAnchor = std::chrono::steady_clock::now();
 
                 { lock_guard<mutex> lk(g_Media.lock); g_Media.position = seconds; }
                 break;
@@ -555,9 +620,13 @@ void DrawArtWithFade(Graphics& gfx, GraphicsPath& clipPath,
 }
 
 void DrawPanel(HDC hdc, int W, int H) {
+    // Skip drawing if window is hidden
+    if (!IsWindowVisible(g_hWnd)) return;
+
     Graphics gfx(hdc);
     gfx.SetSmoothingMode(SmoothingModeAntiAlias);
     gfx.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+    gfx.SetInterpolationMode(InterpolationModeHighQualityBicubic);
     gfx.Clear(Color(0, 0, 0, 0));
 
     wstring title, artist;
@@ -576,9 +645,12 @@ void DrawPanel(HDC hdc, int W, int H) {
         dur       = g_Media.duration;
     }
 
+    // ── High-resolution position interpolation ─────────────────────────────────
     double displayPos = localPos;
     if (isPlaying && lastTick > 0 && dur > 0) {
-        double elapsed = (double)(GetTickCount64() - lastTick) / 1000.0;
+        using namespace std::chrono;
+        auto now = steady_clock::now();
+        double elapsed = duration<double>(now - g_InterpolationAnchor).count();
         displayPos = min(dur, localPos + elapsed);
     }
 
@@ -589,6 +661,9 @@ void DrawPanel(HDC hdc, int W, int H) {
     int artX     = pad, artY = pad;
     int contentX = artX + artSize + (int)(10 * s * 0.5f);
     int contentW = W - contentX - pad;
+
+    // Store art rect for dirty region updates
+    g_ArtRect = {artX, artY, artX + artSize, artY + artSize};
 
     // ── 1. Album Art with crossfade ──────────────────────────────────────────
     GraphicsPath artPath;
@@ -855,10 +930,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
     switch (msg) {
     case WM_CREATE:
         UpdateAppearance(hwnd);
-        SetTimer(hwnd, IDT_MEDIA,    500, NULL);
+        g_CurrentPollInterval = 500;
+        SetTimer(hwnd, IDT_MEDIA,    g_CurrentPollInterval, NULL);
         SetTimer(hwnd, IDT_PROGRESS, 100, NULL);
         RegisterHook(hwnd);
         g_HoverState = -1;
+        g_InterpolationAnchor = std::chrono::steady_clock::now();
         return 0;
 
     case WM_ERASEBKGND: return 1;
@@ -866,16 +943,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
     case APP_CLOSE:     DestroyWindow(hwnd); return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_MEDIA);
+        KillTimer(hwnd, IDT_PROGRESS);
         KillTimer(hwnd, IDT_FADE);
+        KillTimer(hwnd, IDT_ANIM);
         if (g_Hook) { UnhookWinEvent(g_Hook); g_Hook = nullptr; }
         g_SessionManager = nullptr;
         { lock_guard<mutex> fg(g_FadeMtx);
           if (g_PrevArt) { delete g_PrevArt; g_PrevArt = nullptr; } }
+        // Cleanup cached resources
+        if (g_CachedTrackBrush) { delete g_CachedTrackBrush; g_CachedTrackBrush = nullptr; }
+        if (g_CachedFillBrush) { delete g_CachedFillBrush; g_CachedFillBrush = nullptr; }
+        if (g_CachedTimeBrush) { delete g_CachedTimeBrush; g_CachedTimeBrush = nullptr; }
+        if (g_CachedTitleFont) { delete g_CachedTitleFont; g_CachedTitleFont = nullptr; }
+        if (g_CachedArtistFont) { delete g_CachedArtistFont; g_CachedArtistFont = nullptr; }
+        if (g_CachedTimeFont) { delete g_CachedTimeFont; g_CachedTimeFont = nullptr; }
+        if (g_CachedFontFamily) { delete g_CachedFontFamily; g_CachedFontFamily = nullptr; }
         PostQuitMessage(0);
         return 0;
 
     case WM_SETTINGCHANGE:
         UpdateAppearance(hwnd);
+        InvalidateCache();
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
 
@@ -909,6 +998,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
             }
             bool playing=false, ytm=false;
             { lock_guard<mutex> g(g_Media.lock); playing=g_Media.isPlaying; ytm=g_Media.isYTM; }
+            
+            // Adaptive polling: faster when playing, slower when paused/idle
+            int newInterval = (playing && ytm) ? 250 : 1000;
+            if (newInterval != g_CurrentPollInterval) {
+                g_CurrentPollInterval = newInterval;
+                SetTimer(hwnd, IDT_MEDIA, newInterval, NULL);
+            }
+            g_IsPlaying = playing;
+
             if (!ytm) { shouldHide=true; g_IdleCounter=0; g_IsHiddenByIdle=false; }
             if (ytm && g_Settings.idleTimeout>0) {
                 if (playing) { g_IdleCounter=0; g_IsHiddenByIdle=false; }
@@ -923,7 +1021,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
             InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (wP == IDT_PROGRESS) {
-            InvalidateRect(hwnd, NULL, FALSE);
+            // Dirty rectangle: only redraw progress bar area
+            RECT pr = g_ProgressRect;
+            InvalidateRect(hwnd, &pr, FALSE);
         }
         else if (wP == IDT_FADE) {
             bool done = false;
