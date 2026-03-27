@@ -2,7 +2,7 @@
 // @id              taskbar-music-lounge-ytm
 // @name            Taskbar Music Lounge - YouTube Music
 // @description     Spotify-style miniplayer for YouTube Music with album art, controls, progress bar and crossfade transitions.
-// @version         1.5.0
+// @version         1.6.0
 // @author          Hashah2311 / fork
 // @include         explorer.exe
 // @compilerOptions -lole32 -ldwmapi -lgdi32 -luser32 -lwindowsapp -lshcore -lgdiplus -lshell32
@@ -23,6 +23,8 @@ A Spotify-style floating miniplayer that activates **only** when YouTube Music i
 - Seek by clicking or dragging — stays in place after seek
 - Smart idle timeout & fullscreen hiding
 - Auto light/dark theme
+- Click-through when nothing is playing
+- Smooth fade-out near track end + fade-in on new track
 
 ## Requirements
 - Windows 11
@@ -54,6 +56,8 @@ A Spotify-style floating miniplayer that activates **only** when YouTube Music i
   $name: Manual text color (hex, used when AutoTheme off)
 - BgOpacity: 128
   $name: Acrylic tint opacity (0-255)
+- EndFadeThreshold: 4
+  $name: Seconds before track end to start fade-out (0 = off)
 */
 // ==/WindhawkModSettings==
 
@@ -104,17 +108,18 @@ typedef HWND(WINAPI* pCreateWindowInBand)(DWORD,LPCWSTR,LPCWSTR,DWORD,int,int,in
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 struct ModSettings {
-    int    width          = 500;
-    int    height         = 130;
-    int    fontSize       = 18;
-    double buttonScale    = 2.0;
-    bool   hideFullscreen = false;
-    int    idleTimeout    = 25;
-    int    offsetX        = 1417;
-    int    offsetY        = -95;
-    bool   autoTheme      = true;
-    DWORD  manualTextColor= 0xFFFFFFFF;
-    int    bgOpacity      = 128;
+    int    width             = 500;
+    int    height            = 130;
+    int    fontSize          = 18;
+    double buttonScale       = 2.0;
+    bool   hideFullscreen    = false;
+    int    idleTimeout       = 25;
+    int    offsetX           = 1417;
+    int    offsetY           = -95;
+    bool   autoTheme         = true;
+    DWORD  manualTextColor   = 0xFFFFFFFF;
+    int    bgOpacity         = 128;
+    double endFadeThreshold  = 4.0;
 } g_Settings;
 
 void LoadSettings() {
@@ -127,6 +132,7 @@ void LoadSettings() {
     g_Settings.offsetY        = Wh_GetIntSetting(L"OffsetY");
     g_Settings.autoTheme      = Wh_GetIntSetting(L"AutoTheme") != 0;
     g_Settings.bgOpacity      = max(0, min(255, Wh_GetIntSetting(L"BgOpacity")));
+    g_Settings.endFadeThreshold = (double)max(0, min(30, Wh_GetIntSetting(L"EndFadeThreshold")));
 
     PCWSTR sc = Wh_GetStringSetting(L"ButtonScale");
     g_Settings.buttonScale = sc ? max(0.5, min(4.0, _wtof(sc))) : 2.0;
@@ -200,6 +206,20 @@ wstring g_PrevArtist = L"";
 static const int FADE_STEP     = 12;
 static const int FADE_TIMER_MS = 16;
 
+// ─── End-of-Track Fade State ─────────────────────────────────────────────────
+// Target window alpha driven by end-fade logic.
+// Separate from the crossfade alpha (which lives in g_FadeAlpha).
+BYTE  g_WindowAlpha         = 255;   // current SetLayeredWindowAttributes alpha
+bool  g_EndFadeActive       = false; // currently fading out near end of track
+bool  g_FadeInPending       = false; // waiting to fade back in after track change
+float g_FadeInAlpha         = 0.0f;  // 0..255, used during fade-in animation
+static const int IDT_FADEIN = 1005;  // timer id for fade-in animation
+static const int FADEIN_STEP_MS = 16;
+static const float FADEIN_STEP  = 10.0f; // alpha increment per frame (~430ms total)
+
+// ─── Click-through State ─────────────────────────────────────────────────────
+bool g_ClickThrough = false; // true when WS_EX_TRANSPARENT is set
+
 // ─── Media State ─────────────────────────────────────────────────────────────
 struct MediaState {
     wstring title    = L"Nothing playing";
@@ -253,6 +273,27 @@ wstring FormatTime(double sec) {
 double GetHighResTime() {
     using namespace std::chrono;
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count() / 1000.0;
+}
+
+// ─── Click-through Helper ────────────────────────────────────────────────────
+// Adds or removes WS_EX_TRANSPARENT so the window either eats or passes clicks.
+void SetClickThrough(HWND hwnd, bool enable) {
+    if (g_ClickThrough == enable) return;
+    g_ClickThrough = enable;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (enable)
+        ex |=  WS_EX_TRANSPARENT;
+    else
+        ex &= ~WS_EX_TRANSPARENT;
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+}
+
+// ─── Window Alpha Helper ─────────────────────────────────────────────────────
+void ApplyWindowAlpha(BYTE alpha) {
+    if (!g_hWnd) return;
+    if (g_WindowAlpha == alpha) return;
+    g_WindowAlpha = alpha;
+    SetLayeredWindowAttributes(g_hWnd, 0, alpha, LWA_ALPHA);
 }
 
 // ─── Resource Cache ──────────────────────────────────────────────────────────
@@ -416,10 +457,10 @@ void UpdateMediaInfo() {
             lock_guard<mutex> g(g_Media.lock);
 
             if (titleChanged) {
-                // Reset interpolation for the new track only — do NOT touch g_SeekLockUntil
-                // so an in-flight seek on the current track isn't cancelled.
                 g_LocalPos    = 0;
                 g_LastPosTick = 0;
+                // Signal fade-in for new track
+                if (g_hWnd) PostMessage(g_hWnd, WM_APP + 21, 0, 0);
             }
 
             g_Media.title    = newTitle;
@@ -434,8 +475,6 @@ void UpdateMediaInfo() {
                 auto end = tline.EndTime();
                 g_Media.duration = chrono::duration<double>(end).count();
 
-                // ── High-resolution position sync ───────────────────────────────
-                // Only update when not scrubbing and seek-lock has expired.
                 if (!g_Scrubbing && now >= g_SeekLockUntil) {
                     auto pos      = tline.Position();
                     double newPos = chrono::duration<double>(pos).count();
@@ -449,7 +488,6 @@ void UpdateMediaInfo() {
                 }
             }
 
-            // ── Art swap + crossfade ──────────────────────────────────────────
             if (freshArt) {
                 Bitmap* prevArt = g_Media.albumArt;
                 g_Media.albumArt = freshArt;
@@ -509,7 +547,6 @@ void SeekTo(double seconds) {
                     chrono::duration<double>(seconds)).count();
                 s.TryChangePlaybackPositionAsync(ticks);
 
-                // Anchor interpolator at the seek target
                 ULONGLONG now   = GetTickCount64();
                 g_LocalPos      = seconds;
                 g_LastPosTick   = now;
@@ -620,7 +657,6 @@ void DrawArtWithFade(Graphics& gfx, GraphicsPath& clipPath,
 }
 
 void DrawPanel(HDC hdc, int W, int H) {
-    // Skip drawing if window is hidden
     if (!IsWindowVisible(g_hWnd)) return;
 
     Graphics gfx(hdc);
@@ -662,7 +698,6 @@ void DrawPanel(HDC hdc, int W, int H) {
     int contentX = artX + artSize + (int)(10 * s * 0.5f);
     int contentW = W - contentX - pad;
 
-    // Store art rect for dirty region updates
     g_ArtRect = {artX, artY, artX + artSize, artY + artSize};
 
     // ── 1. Album Art with crossfade ──────────────────────────────────────────
@@ -704,7 +739,6 @@ void DrawPanel(HDC hdc, int W, int H) {
         sf2.SetFormatFlags(StringFormatFlagsNoWrap);
         gfx.DrawString(L"Nothing playing", -1, &titleFont, r, &sf2, &dimBrush);
     } else {
-        // ── Snapshot fade state ──────────────────────────────────────────────
         int     fadeAlpha  = 255;
         bool    fading     = false;
         wstring prevTitle, prevArtist;
@@ -924,6 +958,7 @@ void RegisterHook(HWND hwnd) {
 #define IDT_ANIM     1002
 #define IDT_PROGRESS 1003
 #define IDT_FADE     1004
+// IDT_FADEIN = 1005 defined above
 #define APP_CLOSE    WM_APP
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
@@ -936,6 +971,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
         RegisterHook(hwnd);
         g_HoverState = -1;
         g_InterpolationAnchor = std::chrono::steady_clock::now();
+        g_WindowAlpha = 255;
+        g_ClickThrough = false;
         return 0;
 
     case WM_ERASEBKGND: return 1;
@@ -947,18 +984,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
         KillTimer(hwnd, IDT_PROGRESS);
         KillTimer(hwnd, IDT_FADE);
         KillTimer(hwnd, IDT_ANIM);
+        KillTimer(hwnd, IDT_FADEIN);
         if (g_Hook) { UnhookWinEvent(g_Hook); g_Hook = nullptr; }
         g_SessionManager = nullptr;
         { lock_guard<mutex> fg(g_FadeMtx);
           if (g_PrevArt) { delete g_PrevArt; g_PrevArt = nullptr; } }
-        // Cleanup cached resources
-        if (g_CachedTrackBrush) { delete g_CachedTrackBrush; g_CachedTrackBrush = nullptr; }
-        if (g_CachedFillBrush) { delete g_CachedFillBrush; g_CachedFillBrush = nullptr; }
-        if (g_CachedTimeBrush) { delete g_CachedTimeBrush; g_CachedTimeBrush = nullptr; }
-        if (g_CachedTitleFont) { delete g_CachedTitleFont; g_CachedTitleFont = nullptr; }
-        if (g_CachedArtistFont) { delete g_CachedArtistFont; g_CachedArtistFont = nullptr; }
-        if (g_CachedTimeFont) { delete g_CachedTimeFont; g_CachedTimeFont = nullptr; }
-        if (g_CachedFontFamily) { delete g_CachedFontFamily; g_CachedFontFamily = nullptr; }
+        if (g_CachedTrackBrush)  { delete g_CachedTrackBrush;  g_CachedTrackBrush  = nullptr; }
+        if (g_CachedFillBrush)   { delete g_CachedFillBrush;   g_CachedFillBrush   = nullptr; }
+        if (g_CachedTimeBrush)   { delete g_CachedTimeBrush;   g_CachedTimeBrush   = nullptr; }
+        if (g_CachedTitleFont)   { delete g_CachedTitleFont;   g_CachedTitleFont   = nullptr; }
+        if (g_CachedArtistFont)  { delete g_CachedArtistFont;  g_CachedArtistFont  = nullptr; }
+        if (g_CachedTimeFont)    { delete g_CachedTimeFont;    g_CachedTimeFont    = nullptr; }
+        if (g_CachedFontFamily)  { delete g_CachedFontFamily;  g_CachedFontFamily  = nullptr; }
         PostQuitMessage(0);
         return 0;
 
@@ -986,6 +1023,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
         return 0;
     }
 
+    // ── Fade-in trigger (new track started) ───────────────────────────────────
+    case WM_APP + 21: {
+        // Cancel any in-progress fade-in and restart
+        KillTimer(hwnd, IDT_FADEIN);
+        g_EndFadeActive = false;
+        g_FadeInPending = true;
+        g_FadeInAlpha   = g_WindowAlpha; // start from wherever we currently are
+        SetTimer(hwnd, IDT_FADEIN, FADEIN_STEP_MS, NULL);
+        return 0;
+    }
+
     case WM_TIMER:
         if (wP == IDT_MEDIA) {
             UpdateMediaInfo();
@@ -996,10 +1044,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
                     if (qs==QUNS_BUSY||qs==QUNS_RUNNING_D3D_FULL_SCREEN||qs==QUNS_PRESENTATION_MODE)
                         shouldHide = true;
             }
-            bool playing=false, ytm=false;
-            { lock_guard<mutex> g(g_Media.lock); playing=g_Media.isPlaying; ytm=g_Media.isYTM; }
-            
-            // Adaptive polling: faster when playing, slower when paused/idle
+            bool playing=false, ytm=false, hasMedia=false;
+            { lock_guard<mutex> g(g_Media.lock);
+              playing=g_Media.isPlaying; ytm=g_Media.isYTM; hasMedia=g_Media.hasMedia; }
+
+            // ── Click-through when no media ──────────────────────────────────
+            // Pass mouse events through to whatever is behind the widget when
+            // YTM isn't active so the taskbar stays fully usable.
+            SetClickThrough(hwnd, !ytm || !hasMedia);
+
             int newInterval = (playing && ytm) ? 250 : 1000;
             if (newInterval != g_CurrentPollInterval) {
                 g_CurrentPollInterval = newInterval;
@@ -1021,6 +1074,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
             InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (wP == IDT_PROGRESS) {
+            // ── End-of-track fade logic ──────────────────────────────────────
+            if (g_Settings.endFadeThreshold > 0.0) {
+                double pos = 0, dur = 0;
+                bool playing = false;
+                {
+                    lock_guard<mutex> g(g_Media.lock);
+                    dur     = g_Media.duration;
+                    playing = g_Media.isPlaying;
+                }
+
+                // Use interpolated position for accuracy
+                if (playing && dur > 0) {
+                    using namespace std::chrono;
+                    auto now2    = steady_clock::now();
+                    double elap  = duration<double>(now2 - g_InterpolationAnchor).count();
+                    pos          = min(dur, g_LocalPos + elap);
+
+                    double remaining = dur - pos;
+
+                    if (remaining <= g_Settings.endFadeThreshold && remaining >= 0.0 && !g_FadeInPending) {
+                        // Map remaining time to alpha: threshold→255, 0→60
+                        float t     = (float)(remaining / g_Settings.endFadeThreshold); // 1.0..0.0
+                        BYTE  alpha = (BYTE)(60.0f + t * 195.0f);                       // 255..60
+                        g_EndFadeActive = true;
+                        ApplyWindowAlpha(alpha);
+                    } else if (!g_EndFadeActive && !g_FadeInPending) {
+                        // Normal playback, ensure full alpha
+                        ApplyWindowAlpha(255);
+                    }
+                } else if (!g_EndFadeActive && !g_FadeInPending) {
+                    ApplyWindowAlpha(255);
+                }
+            }
+
             InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (wP == IDT_FADE) {
@@ -1036,6 +1123,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
                 }
             }
             if (done) KillTimer(hwnd, IDT_FADE);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        else if (wP == IDT_FADEIN) {
+            // Animate window alpha from current level back up to 255
+            g_FadeInAlpha += FADEIN_STEP;
+            if (g_FadeInAlpha >= 255.0f) {
+                g_FadeInAlpha   = 255.0f;
+                g_FadeInPending = false;
+                g_EndFadeActive = false;
+                ApplyWindowAlpha(255);
+                KillTimer(hwnd, IDT_FADEIN);
+            } else {
+                ApplyWindowAlpha((BYTE)g_FadeInAlpha);
+            }
             InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (wP == IDT_ANIM) {
