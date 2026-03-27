@@ -1022,7 +1022,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wP, LPARAM lP) {
         }
         else if (wP == IDT_PROGRESS) {
             // Dirty rectangle: only redraw progress bar area
-            RECT pr = g_ProgressRect;
+            RECT pr = { g_ProgressRect.x, g_ProgressRect.y, 
+                        g_ProgressRect.x + g_ProgressRect.w, 
+                        g_ProgressRect.y + g_ProgressRect.h };
             InvalidateRect(hwnd, &pr, FALSE);
         }
         else if (wP == IDT_FADE) {
