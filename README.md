@@ -11,15 +11,16 @@ A Spotify-style floating miniplayer for YouTube Music, displayed on the Windows 
 - **Click-to-seek** on the progress bar
 - **Auto light/dark theme** based on Windows settings
 - **Smart hiding** when YouTube Music stops or goes fullscreen
+- **Click-through** when idle (taskbar stays usable)
+- **End-of-track fade** effect
+- **Fade-in animation** on new track start
 - **Adaptive polling** for optimized CPU usage
-- **Dirty rectangle rendering** for efficient redraws
 
 ## Performance Optimizations
 
 - **Adaptive polling**: 250ms when playing, 1000ms when paused
 - **High-resolution interpolation**: Uses `std::chrono::steady_clock` for smooth progress
 - **Resource caching**: Fonts and brushes cached to reduce GDI+ allocations
-- **Dirty rectangles**: Only redraws changed regions
 - **Skip hidden redraws**: No rendering when window is hidden
 
 ## Requirements
@@ -46,9 +47,11 @@ A Spotify-style floating miniplayer for YouTube Music, displayed on the Windows 
 | Button Scale | 2.0 | Button scaling factor |
 | Hide Fullscreen | false | Hide when apps are fullscreen |
 | Idle Timeout | 25 | Seconds before hiding when paused (0 = off) |
-| Offset X/Y | 1417/-95 | Position adjustment from taskbar |
+| Offset X | 1417 | X position offset from taskbar left |
+| Offset Y | -95 | Y position offset from taskbar center |
 | Auto Theme | true | Follow Windows light/dark mode |
 | Bg Opacity | 128 | Acrylic background opacity (0-255) |
+| End Fade Threshold | 4 | Seconds before track end to start fade (0 = off) |
 
 ## Layout
 
